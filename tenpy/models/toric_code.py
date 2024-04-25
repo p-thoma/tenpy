@@ -10,8 +10,6 @@ import numpy as np
 from .lattice import Lattice, get_order, _parse_sites
 from ..networks.site import SpinHalfSite
 from .model import CouplingMPOModel
-from ..tools.params import asConfig
-from ..tools.misc import any_nonzero
 
 __all__ = ['DualSquare', 'ToricCode']
 
@@ -119,9 +117,8 @@ class ToricCode(CouplingMPOModel):
             Dimension of the lattice, number of plaquettes around the cylinder.
         conserve : 'parity' | None
             What should be conserved. See :class:`~tenpy.networks.Site.SpinHalfSite`.
-        sort_charge : bool | None
-            Whether to sort by charges of physical legs.
-            See change comment in :class:`~tenpy.networks.site.Site`.
+        sort_charge : bool
+            Whether to sort by charges of physical legs. `True` by default.
         Jv, Jp : float | array
             Couplings as defined for the Hamiltonian above.
         order : str
@@ -143,7 +140,7 @@ class ToricCode(CouplingMPOModel):
 
     def init_sites(self, model_params):
         conserve = model_params.get('conserve', 'parity')
-        sort_charge = model_params.get('sort_charge', None)
+        sort_charge = model_params.get('sort_charge', True)
         site = SpinHalfSite(conserve, sort_charge=sort_charge)
         return site
 

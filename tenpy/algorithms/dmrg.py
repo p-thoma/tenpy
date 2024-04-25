@@ -39,9 +39,8 @@ import logging
 logger = logging.getLogger(__name__)
 
 from ..linalg import np_conserved as npc
-from ..networks.mps import MPSEnvironment
 from ..linalg.krylov_based import lanczos_arpack, LanczosGroundState
-from .truncation import truncate, svd_theta
+from .truncation import svd_theta
 from ..tools.params import asConfig
 from ..tools.math import entropy
 from ..tools.process import memory_usage
@@ -55,13 +54,6 @@ __all__ = [
     'TwoSiteDMRGEngine',
     'chi_list',
     'full_diag_effH',
-    'Mixer',
-    'DensityMatrixMixer',
-    'SubspaceExpansion',
-    'SingleSiteMixer',
-    'TwoSiteMixer',
-    'EngineCombine',
-    'EngineFracture',
 ]
 
 
@@ -114,72 +106,6 @@ def run(psi, model, options, **kwargs):
     }
 
 
-class Mixer(mps_common.Mixer):
-    """Deprecated.
-
-    .. deprecated :: 1.0.0
-        Use :class:`~tenpy.algorithms.mps_common.Mixer` instead.
-        Note the changed function names and signatures
-    """
-    deprecated = True # disable class in find_subclass()
-    update_sites = 2
-
-    def __init__(self, options, sweep_activated):
-        msg = ('The `Mixer`, `SubspaceExpansion` and `DensityMatrixMixer` have been moved '
-               'to tenpy.algorithms.mps_common. Note the changed function names and signatures.')
-        warnings.warn(msg, category=FutureWarning, stacklevel=2)
-        super().__init__(options, sweep_activated)
-
-
-class SubspaceExpansion(Mixer, mps_common.SubspaceExpansion):
-    """Deprecated.
-
-    .. deprecated :: 1.0.0
-        Use :class:`~tenpy.algorithms.mps_common.SubspaceExpansion` instead.
-        Note the changed function names and signatures
-    """
-    update_sites = 1
-
-    def perturb_svd(self, engine, theta, i0, move_right):
-        U, S, VH, err = self.mix_and_decompose_1site(engine, theta, i0, move_right)
-        return U, S, VH, err, S
-
-
-class SingleSiteMixer(SubspaceExpansion):
-    r"""Deprecated name for the :class:`SubspaceExpansion` class.
-
-    .. deprecated :: 0.5.0
-       Instead of `SingleSiteMixer` and `TwoSiteMixer`, directly use :class:`SubspaceExpansion`
-       which is compatible with both single-site and two-site DMRG.
-    """
-    def __init__(self, *args, **kwargs):
-        msg = ("The `SingleSiteMixer` and `TwoSiteMixer` have been replaced by the unified "
-               "`SubspaceExpansion` class, and\n"
-               "all mixers are compatible with both SingleSiteDMRGEngine and TwoSiteDMRGEngine.")
-        warnings.warn(msg, category=FutureWarning, stacklevel=2)
-        super().__init__(*args, **kwargs)
-
-
-class TwoSiteMixer(SingleSiteMixer):
-    # Both DMRG engines have code in mixed_svd to support both single-site and two-site mixers
-    pass
-
-
-class DensityMatrixMixer(Mixer, mps_common.DensityMatrixMixer):
-    """Deprecated.
-
-    .. deprecated :: 1.0.0
-        Use :class:`~tenpy.algorithms.mps_common.DensityMatrixMixer` instead.
-        Note the changed function names and signatures
-    """
-    update_sites = 2
-
-    def perturb_svd(self, engine, theta, i0, update_LP, update_RP):
-        qtotal_LR = [engine.psi.get_B(i0, form=None).qtotal,
-                     engine.psi.get_B(i0 + 1, form=None).qtotal]
-        return self.mixed_svd_2site(engine, theta, i0, update_LP, update_RP, qtotal_LR)
-
-
 class DMRGEngine(IterativeSweeps):
     """DMRG base class with common methods for the TwoSiteDMRG and SingleSiteDMRG.
 
@@ -190,9 +116,6 @@ class DMRGEngine(IterativeSweeps):
 
     A generic protocol for approaching a physics question using DMRG is given in
     :doc:`/intro/dmrg-protocol`.
-
-    .. deprecated :: 0.5.0
-        Renamed parameter/attribute `DMRG_params` to :attr:`options`.
 
     Options
     -------
@@ -298,11 +221,6 @@ class DMRGEngine(IterativeSweeps):
         decay_infinite = decay_finite ** (disable_finite / disable_infinite)
         mixer_options.setdefault('decay', decay_finite if self.finite else decay_infinite)
         mixer_options.setdefault('disable_after', disable_finite if self.finite else disable_infinite)
-
-    @property
-    def DMRG_params(self):
-        warnings.warn("renamed self.DMRG_params -> self.options", FutureWarning, stacklevel=2)
-        return self.options
 
     def pre_run_initialize(self):
         super().pre_run_initialize()
@@ -515,6 +433,17 @@ class DMRGEngine(IterativeSweeps):
         self._canonicalize(True)
         logger.info(f'{self.__class__.__name__} finished after {self.sweeps} sweeps, '
                     f'max chi={max(self.psi.chi)}')
+        if (len(self.ortho_to_envs) > 0) and (self.sweep_stats['E'][-1] > -1e-8):
+            msg = (f'{self.__class__.__name__} with orthogonal_to, i.e. searching for excited '
+                   f'states, terminated with an energy consistent with zero. '
+                   f'Orthogonality can not be guaranteed. Consider adding a negative constant to '
+                   f'the Hamiltonian such that the target state has negative energy. '
+                   f'See https://github.com/tenpy/tenpy/issues/329 for more information.')
+            # stacklevel: (1) this
+            #             (2) DMRGEngine.run()
+            #             (3) IterativeSweeps.run()
+            #             (4) user context
+            warnings.warn(msg, stacklevel=4)
 
     def run(self):
         """Run the DMRG simulation to find the ground state.
@@ -698,6 +627,64 @@ class DMRGEngine(IterativeSweeps):
         self.update_stats['time'].append(time.time() - self.time0)
         self.trunc_err_list.append(err.eps)
         self.E_trunc_list.append(E_trunc)
+
+        if self.psi.bc == 'segment':
+            self.update_segment_boundaries()
+
+    def update_segment_boundaries(self):
+        """Update the singular values at the boundaries of the segment.
+
+        This method is called at the end of :meth:`post_update_local` for 'segment' boundary MPS.
+        It just updates the singular values on the very left/right end of the MPS segment.
+        """
+        psi = self.psi
+        if self.i0 == 0 and self.move_right:
+            # need to update bond to the left of site j=0
+            j = 0
+            A = psi.get_B(j, form='A')
+            th = psi.get_B(j, form='Th')
+            U, S, V = npc.svd(th.combine_legs(psi._p_label + ['vR'], qconj=-1),
+                              cutoff=0,
+                              qtotal_LR=[None, th.qtotal],
+                              inner_labels=['vR', 'vL'])
+            S = S / np.linalg.norm(S)
+            psi.set_SL(j, S)
+            A_new = npc.tensordot(U.conj().replace_label('vR*', 'vL'), A, ['vL*', 'vL'])
+            psi.set_B(j, A_new, form='A')
+
+            old_UL, old_VR = psi.segment_boundaries
+            new_UL = npc.tensordot(old_UL, U, axes=['vR', 'vL'])
+            psi.segment_boundaries = (new_UL, old_VR)
+
+            for env in self._all_envs:
+                update_ket = env.ket is psi
+                update_bra = env.bra is psi
+                env._update_gauge_LP(j, U, update_bra, update_ket)
+            # No need to clear the environments on the other bonds!
+
+        elif self.i0 == psi.L - self.EffectiveH.length and not self.move_right:
+            # need to update bond on the right of site j=L-1
+            j = psi.L - 1
+            B = psi.get_B(j, form='B')
+            th = psi.get_B(j, form='Th')
+            U, S, V = npc.svd(th.combine_legs(['vL'] + psi._p_label, qconj=+1),
+                              cutoff=0,
+                              qtotal_LR=[th.qtotal, None],
+                              inner_labels=['vR', 'vL'])
+            S = S / np.linalg.norm(S)
+            psi.set_SR(j, S)
+            B_new = npc.tensordot(B, V.conj().replace_label('vL*', 'vR'), ['vR', 'vR*'])
+            psi.set_B(j, B_new, form='B')
+
+            old_UL, old_VR = psi.segment_boundaries
+            new_VR = npc.tensordot(V, old_VR, axes=['vR', 'vL'])
+            psi.segment_boundaries = (old_UL, new_VR)
+
+            for env in self._all_envs:
+                update_ket = env.ket is psi
+                update_bra = env.bra is psi
+                env._update_gauge_RP(j, V, update_bra, update_ket)
+            # No need to clear the environments on the other bonds!
 
     def diag(self, theta_guess):
         """Diagonalize the effective Hamiltonian represented by self.
@@ -1288,44 +1275,6 @@ class SingleSiteDMRGEngine(DMRGEngine):
             msg = (f'Using {self.mixer.__class__.__name__} with single-site DMRG is inefficient. '
                    f'The resulting algorithm has two-site costs!')
             warnings.warn(msg)
-
-
-class EngineCombine(TwoSiteDMRGEngine):
-    r"""Engine which combines legs into pipes as far as possible.
-
-    This engine combines the virtual and physical leg for the left site and right site into pipes.
-    This reduces the overhead of calculating charge combinations in the contractions,
-    but one :meth:`matvec` is formally more expensive, :math:`O(2 d^3 \chi^3 D)`.
-
-    .. deprecated :: 0.5.0
-       Directly use the :class:`TwoSiteDMRGEngine` with the DMRG parameter ``combine=True``.
-    """
-    def __init__(self, psi, model, DMRG_params):
-        msg = ("Old-style engines are deprecated in favor of `Sweep` subclasses.\n"
-               "Use `TwoSiteDMRGEngine` with parameter `combine=True` "
-               "instead of `EngineCombine`.")
-        warnings.warn(msg, category=FutureWarning, stacklevel=2)
-        DMRG_params['combine'] = True  # to reproduces old-style engine
-        super().__init__(psi, model, DMRG_params)
-
-
-class EngineFracture(TwoSiteDMRGEngine):
-    r"""Engine which keeps the legs separate.
-
-    Due to a different contraction order in :meth:`matvec`, this engine might be faster than
-    :class:`EngineCombine`, at least for large physical dimensions and if the MPO is sparse.
-    One :meth:`matvec` is :math:`O(2 \chi^3 d^2 W + 2 \chi^2 d^3 W^2 )`.
-
-    .. deprecated :: 0.5.0
-       Directly use the :class:`TwoSiteDMRGEngine` with the DMRG parameter ``combine=False``.
-    """
-    def __init__(self, psi, model, DMRG_params):
-        msg = ("Old-style engines are deprecated in favor of `Sweep` subclasses.\n"
-               "Use `TwoSiteDMRGEngine` with parameter `combine=False` "
-               "instead of `EngineFracture`.")
-        warnings.warn(msg, category=FutureWarning, stacklevel=2)
-        DMRG_params['combine'] = False  # to reproduces old-style engine
-        super().__init__(psi, model, DMRG_params)
 
 
 def chi_list(chi_max, dchi=20, nsweeps=20):

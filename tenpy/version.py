@@ -22,7 +22,7 @@ __all__ = [
 
 # hard-coded version for people without git...
 #: current release version as a string
-version = '0.11.0'
+version = '1.0.0'
 
 #: whether this is a released version or modified
 released = False
@@ -92,7 +92,6 @@ def _get_version_summary():
     from .tools.optimization import have_cython_functions, compiled_with_MKL
     import numpy
     import scipy
-    import warnings
 
     if have_cython_functions:
         cython_info = "compiled"

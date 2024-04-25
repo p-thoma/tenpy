@@ -12,7 +12,6 @@ import numpy as np
 
 from .model import CouplingMPOModel, NearestNeighborModel
 from .lattice import Chain
-from ..tools.params import asConfig
 from ..networks.site import SpinHalfSite
 
 __all__ = ['TFIModel', 'TFIChain']
@@ -44,9 +43,8 @@ class TFIModel(CouplingMPOModel):
 
         conserve : None | 'parity'
             What should be conserved. See :class:`~tenpy.networks.Site.SpinHalfSite`.
-        sort_charge : bool | None
-            Whether to sort by charges of physical legs.
-            See change comment in :class:`~tenpy.networks.site.Site`.
+        sort_charge : bool
+            Whether to sort by charges of physical legs. `True` by default.
         J, g : float | array
             Coupling as defined for the Hamiltonian above.
 
@@ -57,7 +55,7 @@ class TFIModel(CouplingMPOModel):
         if conserve == 'best':
             conserve = 'parity'
             self.logger.info("%s: set conserve to %s", self.name, conserve)
-        sort_charge = model_params.get('sort_charge', None)
+        sort_charge = model_params.get('sort_charge', True)
         site = SpinHalfSite(conserve=conserve, sort_charge=sort_charge)
         return site
 

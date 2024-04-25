@@ -25,8 +25,5 @@ Changed
 
 Fixed
 ^^^^^
-- MPO methods :meth:`~tenpy.networks.mpo.MPO.dagger`, :meth:`~tenpy.networks.mpo.MPO.is_hermitian`,
-  and :meth:`~tenpy.networks.mpo.MPO.__add__` now respect
-  the :attr:`:~tenpy.networks.mpo.MPO.explicit_plus_hc` flag.
 - The classmethod :meth:`~tenpy.networks.purification_mps.PurificationMPS.from_infiniteT_canonical` 
   can now deal with two independent charges in the `charge_sector`, i.e. as in the :class:`~tenpy.networks.site.SpinHalfFermionSite`.
