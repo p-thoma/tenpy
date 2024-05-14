@@ -31,7 +31,8 @@ def spectral_function(time_dep_corr,
                       truncation_mode: str = 'renormalize',
                       rel_split: float = 0,
                       axis_time: int = 0,
-                      axis_space: int = 1):
+                      axis_space: int = 1,
+                      mixed_space=False):
     r"""Given a time dependent correlation function C(t, r), calculate its
     Spectral Function.
 
@@ -66,6 +67,8 @@ def spectral_function(time_dep_corr,
         time axis (default 0)
     axis_space :
         axis of mps tensors (default 1)
+    mixed_space :
+        experimental feature for using the mixed space approach (no FT over y, only over x)
 
     Returns
     -------
@@ -81,8 +84,7 @@ def spectral_function(time_dep_corr,
         S(w, \mathbf{k}) = \int dt e^{-iwt} \int d\mathbf{r} e^{i \mathbf{k} \mathbf{r} C(t, \mathbf{r})
     """
     # first we fourier transform in space C(r, t) -> C(k, t)
-    ft_space, k = fourier_transform_space(lat, time_dep_corr, axis=axis_space)
-    k_reduced = lat.BZ.reduce_points(k)
+    ft_space, k = fourier_transform_space(lat, time_dep_corr, axis=axis_space, mixed_space=mixed_space)
     # optional linear prediction
     if linear_predict is True:
         ft_space = linear_prediction(ft_space,
@@ -96,28 +98,36 @@ def spectral_function(time_dep_corr,
         ft_space = apply_gaussian_windowing(ft_space, sigma, axis=axis_time)
     # fourier transform in time C(k, t) -> C(k, w) = S
     s_k_w, w = fourier_transform_time(ft_space, dt)
-    return {'S': s_k_w, 'k': k, 'k_reduced': k_reduced, 'w': w}
+    if lat.dim == 1 or mixed_space:
+        return {'S': s_k_w, 'k': k, 'w': w}
+    else:
+        k_reduced = lat.BZ.reduce_points(k)
+        return {'S': s_k_w, 'k': k, 'k_reduced': k_reduced, 'w': w}
 
 
-def fourier_transform_space(lat, a, axis=1):
-    # transform mps array to lattice array
-    a = lat.mps2lat_values(a, axes=axis)  # axis is only an int, since MPS is always "flattened"
-    if lat.dim == 1:
-        ft_space = np.fft.fftn(a, axes=(1, ))
+def fourier_transform_space(lat, a, axis=1, mixed_space=False):
+    if not mixed_space:
+        # transform mps array to lattice array
+        a = lat.mps2lat_values(a, axes=axis)  # axis is only an int, since MPS is always "flattened"
+    if lat.dim == 1 or mixed_space:
+        ft_space = np.fft.fftn(a, axes=(axis,))
         k = np.fft.fftfreq(ft_space.shape[1])
         # shifting
-        ft_space = np.fft.fftshift(ft_space, axes=1)
+        ft_space = np.fft.fftshift(ft_space, axes=axis)
         k = np.fft.fftshift(k)
         # make sure k is returned in correct basis
         # use the norm for the reciprocal basis, in case the basis is 2d (e.g. the ladder lattice)
-        k = k * np.linalg.norm(lat.reciprocal_basis)
+        if mixed_space:
+            k = k * lat.reciprocal_basis[0][0]  # x-component of reciprocal lattice vector
+        else:
+            k = k * np.linalg.norm(lat.reciprocal_basis)
     else:
         # only transform over dims (1, 2), since 3 could hold unit cell index
-        ft_space = np.fft.fftn(a, axes=(1, 2))
-        k_x = np.fft.fftfreq(ft_space.shape[1])
-        k_y = np.fft.fftfreq(ft_space.shape[2])
+        ft_space = np.fft.fftn(a, axes=(axis, axis+1))
+        k_x = np.fft.fftfreq(ft_space.shape[axis])
+        k_y = np.fft.fftfreq(ft_space.shape[axis+1])
         # shifting
-        ft_space = np.fft.fftshift(ft_space, axes=(1, 2))
+        ft_space = np.fft.fftshift(ft_space, axes=(axis, axis+1))
         k_x = np.fft.fftshift(k_x)
         k_y = np.fft.fftshift(k_y)
         # make sure k is returned in correct basis (-> transform into reciprocal basis)

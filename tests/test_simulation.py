@@ -266,8 +266,8 @@ def test_regrouping_and_group_to_NearestNeighborModel():
 
 spectral_sim_params = copy.deepcopy(timeevol_params)
 spectral_sim_params['operator_t0'] = {'opname': 'Sz'}
-spectral_sim_params['operator_t'] = 'Sz'
 spectral_sim_params['model_params']['bc_MPS'] = 'finite'
+spectral_sim_params['results_key'] = 'spectral_function_Sz_Sz'
 
 
 def test_SpectralSimulation():

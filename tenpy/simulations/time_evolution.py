@@ -8,8 +8,10 @@ import warnings
 from . import simulation
 from .simulation import *  # noqa F403
 from ..networks.mps import MPSEnvironment, MPS
+from ..networks.mpo import MPO
 from ..tools.misc import to_iterable, consistency_check
 from ..tools import hdf5_io
+from ..linalg import np_conserved as npc
 
 __all__ = simulation.__all__ + [
     'RealTimeEvolution', 'SpectralSimulation', 'TimeDependentCorrelation',
@@ -87,11 +89,9 @@ class RealTimeEvolution(Simulation):
 class TimeDependentCorrelation(RealTimeEvolution):
     r"""Specialized :class:`RealTimeEvolution` to calculate a time dependent correlation function of a ground state.
 
-    In general this calculates an overlap of the form :math:`C(r, t) = <\psi_0| B_r(t) A_{r_0} |\psi_0>`
-    where :math:`A_{r_0}` can be passed as a simple on-site operator (on site `r0`) or as a product
-    operator acting on several sites. The operator B is currently restricted to a single-site operator.
-    However, passing `B` as a list ``[B_1, B_2, B_3]`` to calculate several overlaps is possible.
-    This class assumes that :math:`|\psi_0>` is a ground-state. In order to evolve arbitrary initial states,
+    In general this calculates an overlap of the form :math:`C(r, t) = \langle\psi_0| B_r(t) A_{r_0} |\psi_0\rangle`
+    where :math:`r_0` is the translationally invariant center of the model.
+    This class assumes that :math:`|\psi_0\rangle` is a ground-state. In order to evolve arbitrary initial states,
     the :class:`TimeDependentCorrelationEvolveBraKet` should be used.
 
     Parameters
@@ -113,9 +113,49 @@ class TimeDependentCorrelation(RealTimeEvolution):
     .. cfg:config :: TimeDependentCorrelation
         :include: TimeEvolution
 
+        mixed_space : bool
+            Whether to use the mixed-space operator representation (for 2D-lattices only) or not.
         ground_state_filename : str
             a filename of a given ground state search (ideally a hdf5 file coming from a finished
             run of a :class:`~tenpy.simulations.ground_state_search.GroundStateSearch`)
+        operator_t0 : dict
+            Mandatory, this must fully specify the operator initially applied to the MPS (i.e. before a time
+            evolution). Two different "types" of operators are supported.
+            An operator can be specified by an ``opname`` (str) and its corresponding
+            index - this can be a ``mps_index`` (int) *or* a ``lat_index`` (list[int]).
+            To specify a product operator, the ``opname`` and ``mps_index`` or ``lat_index`` can be passed
+            as lists where ``opname[i]`` corresponds to ``index[i]```.
+
+            .. note ::
+                The ``lat_idx`` must have a (dim+1) length, i.e. ``[x, y, u]``,
+                where ``u = 0`` for a single-site unit cell.
+
+            Furthermore, mixed space operators (when the corresponding config option ``mixed_space`` is set to True)
+            can be used. A mixed space operator is an operator :math:`O` with a fixed momentum along the y-direction.
+            :math:`\hat{O}_x(k_y) = \frac{1}{\sqrt{L_y}} \sum_y e^{i k_y y} \hat{O}_{x + y}`.
+            In this "mode" a single ``opname`` is necessary. A definite momentum ``k_y`` (defaults to 0) can
+            be specified - note that the range of allowed momenta is restricted based on the "width" of the cylinder.
+            No index can be specified as the mixed space operator is applied at the middle of the cylinder in
+            x-direction and at y=0. Only the default mps-winding and only single site unit cell models are supported.
+
+            .. warning ::
+                This is an experimental feature and probably does not yet work with all
+                classes in :mod:`time_evolution`.
+
+            The optional ``key_name`` can specify the result in the measurements after the preceded string
+            ``'correlation_function_t_'`` and the key for the time evolved operator in either mode.
+        operator_t : dict
+            Optional. The setup is mostly identical to the configuration for operator_t0.
+            If this is left out, the hermitian conjugate of the `operator_t0` will be used.
+            If a product operator is specified, the indices can still be used to specify the *relative* "form"
+            of the operator - however, they will not be absolute, as this operator is applied starting at
+            MPS index 0 and moving through the whole MPS chain. This works because the operator_t is converted
+            into a list of onsite operators (starting at the first site the operator acts on and ending at the
+            last site), together with the integer this list of operators is first applied at - this integer is then
+            dropped.
+        correlation_function_key : str
+            This manually sets the name for the correlation function and overrides the ``key_name``
+            In the operator config.
     """
     default_measurements = RealTimeEvolution.default_measurements + [
         ('simulation_method', 'm_correlation_function'),
@@ -124,7 +164,7 @@ class TimeDependentCorrelation(RealTimeEvolution):
     def __init__(self, options, *, ground_state_data=None, ground_state_filename=None, **kwargs):
         super().__init__(options, **kwargs)
 
-        resume_data = kwargs.get("resume_data", None)
+        resume_data: dict | None = kwargs.get("resume_data", None)
         if resume_data is not None:
             if 'psi_ground_state' in resume_data:
                 self.psi_ground_state = resume_data['psi_ground_state']
@@ -153,11 +193,14 @@ class TimeDependentCorrelation(RealTimeEvolution):
 
         # will be read out in init_state
         self.gs_energy = self.options.get('gs_energy', None)
-        self.operator_t = self.options['operator_t']
         # generate info for operator before time evolution as subconfig
         self.operator_t0_config = self.options.subconfig('operator_t0')
-        self.operator_t0_name = self._get_operator_t0_name()
-        self.operator_t0 = None  # read out config later, since defaults depend on model parameters
+        self.operator_t_config = self.options.subconfig('operator_t')
+        self.operator_t0: list | None = None
+        self.operator_t: tuple | None = None
+        # read out config after model initialization in init_state, since most defaults depend on model params
+        self.correlation_function_key = self.options.get('correlation_function_key', None)
+        self.mixed_space = self.options.get('mixed_space', False)  # TODO: Make work with other classes
 
     def resume_run(self):
         if not hasattr(self, 'psi_ground_state'):
@@ -189,6 +232,18 @@ class TimeDependentCorrelation(RealTimeEvolution):
             self.psi_ground_state = self.psi.copy()
             delattr(self, 'psi')  # free memory
 
+        # configure states here
+        self._configure_operator_t0()
+        self._configure_operator_t()
+        # set keyname
+        if self.correlation_function_key is None:
+            if self.operator_t_name is None and self.operator_t_name is None:
+                self.correlation_function_key = "correlation_function_t"
+            elif self.operator_t_name is None:
+                self.correlation_function_key = f"correlation_function_t_?_{self.operator_t0_name}"
+            elif self.operator_t0_name is None:
+                self.correlation_function_key = f"correlation_function_t_{self.operator_t_name}_?"
+
         if not hasattr(self, 'psi'):
             # copy is essential, since time evolution is probably only performed on psi
             self.psi = self.psi_ground_state.copy()
@@ -204,6 +259,7 @@ class TimeDependentCorrelation(RealTimeEvolution):
         # make sure to get the energy of the ground state, this is needed for the correlation_function
         if self.gs_energy is None:
             self.gs_energy = self.model.H_MPO.expectation_value(self.psi_ground_state)
+            self.logger.info(f"Calculated Energy of initial state as {self.gs_energy:.5f}")
         if self.engine.psi.bc != 'finite':
             raise NotImplementedError(
                 "Only finite MPS boundary conditions are currently implemented for "
@@ -240,49 +296,85 @@ class TimeDependentCorrelation(RealTimeEvolution):
         if not hasattr(self, 'psi_ground_state'):
             self.psi_ground_state = psi_ground_state
 
-    def _get_operator_t0_name(self):
-        operator_t0_name = self.operator_t0_config.get('key_name', None)
-        if operator_t0_name is None:
-            opname = self.operator_t0_config['opname']  # opname is mandatory
-            if len(to_iterable(opname)) == 1:
-                operator_t0_name = opname
+    def _configure_operator_t0(self):
+        key_name = self.operator_t0_config.get('key_name', None)
+        if self.mixed_space is True:
+            self.operator_t0: list = self._get_mixed_space_operator_from_config(self.operator_t0_config, self.model.lat)
+            if key_name is None:
+                key_name = to_iterable(self.operator_t0_config['opname'])[0]
+        else:
+            self.operator_t0: list = self._get_product_operator_from_config(self.operator_t0_config, self.model.lat)
+            if key_name is None:
+                if len(self.operator_t0) != 1:
+                    if self.correlation_function_key is None:
+                        warnings.warn("A 'key_name' should be passed for multiple operators if it was not "
+                                      "set explicitly as 'correlation_function_key'")
+                else:
+                    key_name = self.operator_t0[0][0]
+        self.operator_t0_name = key_name
+
+    def _configure_operator_t(self):
+        if self.mixed_space is True:
+            if self.operator_t_config:
+                self.operator_t: tuple = tuple(self._get_mixed_space_operator_from_config(
+                    self.operator_t_config, self.model.lat))
+                key_name = self.operator_t_config.get('key_name', None)
+                if key_name is None:
+                    key_name = to_iterable(self.operator_t_config['opname'])[0]
             else:
-                raise KeyError("A key_name must be passed for multiple operators")
-        return operator_t0_name
+                assert len(self.operator_t0) == 1
+                w_tot, _ = self.operator_t0[0]
+                Lx = self.model.lat.shape[0]
+                x_indices = self.model.lat.lat2mps_idx([[x, 0, 0] for x in range(Lx)])
+                self.operator_t: tuple = (w_tot.conj(), x_indices, False)
+                # tuple of conjugate operator indices, and need_JW=False
+                key_name = None if self.operator_t0_name is None else self.operator_t0_name + '_dagger'
+        else:  # get a term list
+            if self.operator_t_config:  # empty config would evaluate to False
+                term_list = self._get_product_operator_from_config(self.operator_t_config, self.model.lat)
+                key_name = self.operator_t_config.get('key_name', None)
+                if key_name is None:
+                    if len(term_list) != 1:
+                        if self.correlation_function_key is None:
+                            warnings.warn("A 'key_name' should be passed for multiple operators if it was not "
+                                          "set explicitly as 'correlation_function_key'")
+                    else:
+                        key_name = term_list[0][0]
+            else:
+                sites = self.model.lat.mps_sites()
+                conjugated_ops = []
+                indices = []
+                for op, idx in self.operator_t0:
+                    conjugated_ops.append(sites[idx].get_hc_op_name(op))
+                    indices.append(idx)
+                term_list = list(zip(conjugated_ops, indices))
+                if len(term_list) == 1:
+                    key_name = term_list[0][0]
+                else:
+                    key_name = None if self.operator_t0_name is None else self.operator_t0_name + '_dagger'
+            # convert the term list into a list of operators and provide a list on which to apply them
+            ops, i_min, has_extra_JW = self.psi_ground_state._term_to_ops_list(term_list)
+            indices_list = np.arange(self.model.lat.N_sites - (len(ops) - 1))
+            self.operator_t: tuple = (ops, indices_list, has_extra_JW)
 
-    def _get_operator_t0_list(self):
-        r"""Converts the specified operators and indices into a list of tuples ``[(op1, i_1), (op2, i_2)]``.
+        # set the name of the operator
+        self.operator_t_name = key_name
 
-        Options
-        -------
-        .. cfg:configoptions :: TimeDependentCorrelation
-
-            operator_t0 : dict
-                Mandatory, this should specify the operator initially applied to the MPS (i.e. before a time evolution).
-                For more than one single-site operator, a list of operator names should be passed, otherwise just the
-                string ``opname``. For several operators it is necessary to pass a ``key_name``, this
-                determines the name of the corresponding measurement output see :meth:`_get_operator_t0_name`.
-                The corresponding position(s) to apply the operator(s) should also be passed as
-                a list (or string for a single operator).
-                Either a lattice index ``lat_idx`` or a ``mps_idx`` should be passed.
-
-                .. note ::
-
-                    The ``lat_idx`` must have (dim+1) i.e. ``[x, y, u]``,
-                    where ``u = 0`` for a single-site unit cell
-        """
-        ops = to_iterable(self.operator_t0_config['opname'])  # opname is mandatory
-        mps_idx = self.operator_t0_config.get('mps_idx', None)
-        lat_idx = self.operator_t0_config.get('lat_idx', None)
+    @ staticmethod
+    def _get_product_operator_from_config(subconfig, lat) -> list[tuple]:
+        ops = to_iterable(subconfig['opname'])  # opname is mandatory
+        mps_idx = subconfig.get('mps_idx', None)
+        lat_idx = subconfig.get('lat_idx', None)
         if mps_idx is not None and lat_idx is not None:
             raise KeyError("Either a mps_idx or a lat_idx should be passed")
         elif mps_idx is not None:
-            idx = to_iterable(mps_idx)
+            idx = mps_idx
         elif lat_idx is not None:
-            idx = to_iterable(self.model.lat.lat2mps_idx(lat_idx))
+            idx = lat.lat2mps_idx(lat_idx)
         else:
-            # default to the middle of the MPS sites
-            idx = to_iterable(self.model.lat.N_sites // 2)
+            mid = np.array(lat.shape) // 2  # default to the middle of the Lattice
+            idx = lat.lat2mps_idx(mid)
+        idx = to_iterable(idx)  # make index an iterable for tiling
         # tiling
         if len(ops) > len(idx):
             if len(idx) != 1:
@@ -295,58 +387,89 @@ class TimeDependentCorrelation(RealTimeEvolution):
                     "Ill-defined tiling: num. of operators must be equal to num. of indices or one")
             ops = ops * len(idx)
         # generate list of tuples of form [(op1, i_1), (op2, i_2), ...]
-        op_list = list(zip(ops, idx))
+        term_list = list(zip(ops, idx))
+        return term_list
+
+    @staticmethod
+    def _get_mixed_space_operator_from_config(subconfig, lat) -> list[tuple]:
+        ops = to_iterable(subconfig['opname'])
+        assert len(ops) == 1, "Only mixed space operator along one ring is supported!"
+        assert lat.Lu == 1 and lat.dim == 2, "Only 2d lattice with single-site unit cell supported"
+        assert np.array_equal(lat.order, lat.ordering('default')), "Only default lattice order supported"
+        # get required momentum
+        ky = subconfig.get('ky', None)  # TODO: should we include a test if the momentum is valid?
+        if ky is None:
+            warnings.warn("No momentum for mixed space operator is passed, setting default to 0")
+            ky = 0
+        # y indices (a_y = 1, lattice spacing in y-dir, we excluded 2 site unit cells above)
+        ys = np.arange(lat.shape[1])  # Ly is lat.shape[1]
+        # coefficients in FT
+        coeffs = np.exp(1j * ys * ky)
+        # normalize them
+        coeffs /= np.linalg.norm(coeffs)  
+        sites = []
+        mps_sites = lat.mps_sites()
+        for y in ys:
+            idx = np.array([lat.shape[0]//2, y, 0])
+            sites.append(mps_sites[lat.lat2mps_idx(idx)])
+        # mixed space 'MPO'
+        mixed_space_mpo = MPO.from_wavepacket(sites, coeffs, ops[0])
+        for i, op_i in enumerate(mixed_space_mpo._W):
+            op_i.ireplace_label('p', f'p{i}')
+            op_i.ireplace_label('p*', f'p{i}*')
+            if i == 0:
+                w_tot = op_i
+            else:
+                w_tot = npc.tensordot(w_tot, op_i, axes=('wR', 'wL'))
+        w_tot = npc.trace(w_tot, 'wL', 'wR')  # or w_tot.squeeze()
+        x_ind_0 = np.array([lat.shape[0]//2, 0, 0])
+        op_list = list(zip([w_tot], x_ind_0))
         return op_list
 
     def apply_operator_t0_to_psi(self):
-        self.operator_t0 = self._get_operator_t0_list()
-        ops = self.operator_t0
-        if len(ops) == 1:
-            op, i = ops[0]
+        ops_term = self.operator_t0
+        if len(ops_term) == 1:
+            op, i = ops_term[0]
             self.psi.apply_local_op(i, op)
         else:
-            ops, i_min, _ = self.psi._term_to_ops_list(ops, True)  # applies JW string automatically
-            for i, op in enumerate(ops):
-                self.psi.apply_local_op(i_min + i, op)
+            self.psi.apply_local_term(ops_term)
 
     def m_correlation_function(self, results, psi, model, simulation, **kwargs):
         r"""Measurement function for time dependent correlations.
 
-        For each operator in ``operator_t```, his calculates the overlap of
-        :math:`<\psi| op_j |\phi>`, where :math:`|phi> = e^{-iHt} op1_{idx} |\psi_0>`
-        (the time evolved state after op1 was applied at MPS position idx) and
-        :math:`<psi| = e^{i E_0 t} <\psi|`.
-
-        Options
-        -------
-        .. cfg:configoptions :: TimeDependentCorrelation
-
-            operator_t : str | list
-                The (on-site) operator(s) as string(s) to apply at each measurement step.
-                If a list is passed i.e.: ``['op1', 'op2']``, it will be iterated through the operators
+        This calculates the overlap of :math:`\langle\psi| \text{operator}_t |\phi\rangle`,
+        where :math:`|\phi\rangle = e^{-iHt} \text{operator}_{t0} |\psi_0\rangle`
+        (the time evolved state after operator_t0 was applied at the specified position (defaults to center)) and
+        :math:`e^{i E_0 t} \langle\psi|`.
         """
         self.logger.info("calling m_correlation_function")
-        operator_t = to_iterable(self.operator_t)
+        results_key = self.correlation_function_key
         psi_gs = self.psi_ground_state
         env = MPSEnvironment(psi_gs, psi)
         phase = np.exp(1j * self.gs_energy * self.engine.evolved_time)
-        for op in operator_t:
-            results_key = f"correlation_function_t_{op}_{self.operator_t0_name}"  # as op is a str
-            results[results_key] = env.expectation_value(op)*phase
+        ops, indices_list, has_extraJW = self.operator_t
+        if self.mixed_space:
+            w_tot_conj = ops
+            results[results_key] = env.expectation_value(w_tot_conj, indices_list) * phase
+        else:
+            expvals = []
+            for idx in indices_list:
+                expvals.append(env.expectation_value_multi_sites(ops, idx, insert_JW_from_left=has_extraJW)*phase)
+            results[results_key] = np.array(expvals)
 
 
 class TimeDependentCorrelationEvolveBraKet(TimeDependentCorrelation):
     r"""Evolving the bra and ket state in :class:`TimeDependentCorrelation`.
 
     This class allows the calculation of a time-dependent correlation function for arbitrary states
-    :math:`|\psi>` (not necessarily ground-states).
-    The time-dependent correlation function is :math:`C(r, t) = <\psi| e^{i H t} A e^{-i H t} B |\psi>`
-    where `A` is an operator out of the list of ``operator_t`` and `B` is the ``operator_t0`` at the given site.
+    :math:`|\psi\rangle` (not necessarily ground-states).
+    The time-dependent correlation function is :math:`C(r, t) = \bra{\psi} e^{i H t} B e^{-i H t} A \ket{\psi}`
+    where `B` is the ``operator_t`` and `A` is the ``operator_t0`` at the given site.
 
     .. note ::
 
         Any (custom) measurement function and default measurement are measuring with respect to the
-        state where the ``operator_t0`` was already applied, that is w.r.t. :math:`B |\psi>`
+        state where the ``operator_t0`` was already applied, that is w.r.t. :math:`A |\psi\rangle`
 
 
     Options
@@ -358,7 +481,7 @@ class TimeDependentCorrelationEvolveBraKet(TimeDependentCorrelation):
 
     def __init__(self, *args, **kwargs):
         self.engine_bra = None  # a second engine will be instantiated in :meth:`init_algorithm`
-        resume_data = kwargs.get('resume_data', None)
+        resume_data: dict | None = kwargs.get('resume_data', None)
         if resume_data is not None:
             if 'resume_data_bra' in resume_data:
                 if 'psi' in resume_data['resume_data_bra']:
@@ -412,15 +535,21 @@ class TimeDependentCorrelationEvolveBraKet(TimeDependentCorrelation):
     def m_correlation_function(self, results, psi, model, simulation, **kwargs):
         """Equivalent to :meth:`TimeDependentCorrelation.m_correlation_function`."""
         self.logger.info("calling m_correlation_function")
-        operator_t = to_iterable(self.operator_t)
+        results_key = self.correlation_function_key
         psi_bra = self.engine_bra.psi
         if self.grouped > 1:
             psi_bra = psi_bra.copy()  # make copy since algorithm might use grouped bra
             psi_bra.group_split(self.options['algorithm_params']['trunc_params'])
         env = MPSEnvironment(psi_bra, psi)
-        for op in operator_t:
-            results_key = f"correlation_function_t_{op}_{self.operator_t0_name}"  # as op is a str
-            results[results_key] = env.expectation_value(op)
+        ops, indices_list, has_extraJW = self.operator_t
+        if self.mixed_space:
+            w_tot_conj = ops
+            results[results_key] = env.expectation_value(w_tot_conj, indices_list)
+        else:
+            expvals = []
+            for idx in indices_list:
+                expvals.append(env.expectation_value_multi_sites(ops, idx, insert_JW_from_left=has_extraJW))
+            results[results_key] = np.array(expvals)
 
     def get_resume_data(self) -> dict:
         """Get resume data for a Simulation for two engines."""
@@ -472,6 +601,8 @@ class SpectralSimulation(TimeDependentCorrelation):
             Threshold for raising errors on using too much linear prediction. Default ``3``.
             See :meth:`~tenpy.tools.misc.consistency_check`.
             Can be downgraded to a warning by setting this option to ``None``.
+        results_key : str
+            Optional. The key for the processed spectral function.
     """
 
     def __init__(self, options, *, ground_state_data=None, ground_state_filename=None, **kwargs):
@@ -486,15 +617,16 @@ class SpectralSimulation(TimeDependentCorrelation):
                           options=self.options, threshold_key='max_rel_prediction_time',
                           threshold_default=3,
                           msg="Excessive use of linear prediction; ``max_rel_prediction_time`` exceeded")
-        for key in self.results['measurements'].keys():
-            if 'correlation_function_t' in key:
-                results_key = key.replace('correlation_function_t', 'spectral_function')
-                kwargs_dict = {'results_key': results_key, 'correlation_key': key}
-                kwargs_dict.update(extra_kwargs)  # add parameters for linear prediction etc.
-                pp_entry = ('tenpy.simulations.post_processing', 'pp_spectral_function',
-                            kwargs_dict)
-                # create a new list here! (otherwise this is added to all instances within that session)
-                self.default_post_processing = self.default_post_processing + [pp_entry]
+        if self.correlation_function_key in self.results['measurements']:
+            results_key = self.options.get('results_key', 'spectral_function')
+            kwargs_dict = {'results_key': results_key, 'correlation_key': self.correlation_function_key}
+            kwargs_dict.update(extra_kwargs)  # add parameters for linear prediction etc.
+            if self.mixed_space:
+                kwargs_dict.update({'mixed_space': True})
+            pp_entry = ('tenpy.simulations.post_processing', 'pp_spectral_function',
+                        kwargs_dict)
+            # create a new list here! (otherwise this is added to all instances within that session)
+            self.default_post_processing = self.default_post_processing + [pp_entry]
         return super().run_post_processing()
 
 
