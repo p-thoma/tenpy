@@ -1950,7 +1950,10 @@ class CouplingMPOModel(CouplingModel, MPOModel):
                 Lx = model_params.get('Lx', 1)
                 Ly = model_params.get('Ly', 4)
                 bc_y = model_params.get('bc_y', 'cylinder')
-                assert bc_y in ['cylinder', 'ladder', 'open', 'periodic']
+                if isinstance(bc_y, str):
+                    assert bc_y in ['cylinder', 'ladder', 'open', 'periodic']
+                else:
+                    assert isinstance(bc_y, int)
                 if bc_y == 'cylinder':
                     bc_y = 'periodic'
                 elif bc_y == 'ladder':

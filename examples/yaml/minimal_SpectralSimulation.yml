@@ -13,7 +13,11 @@ operator_t0:
     # lat_idx: [x, y, u]  (or a 2d list for multi operators)
     # mps_idx:
     # key_name:
-operator_t: Sz
+# operator_t:
+#     opname:
+#     key_name:
+
+# correlation_function_key: correlations_my_operator
 
 final_time: 1
 
