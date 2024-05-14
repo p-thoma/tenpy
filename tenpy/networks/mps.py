@@ -136,7 +136,7 @@ the issue of commutation relations for a second).
 An example would be a time evolution operator, say Trotter decomposed as
 
 .. math ::
-    U = exp(-i H t) \approx \prod_{i~\mathrm{even}} e^{-i h_i t}
+    U = \exp(-i H t) \approx \prod_{i~\mathrm{even}} e^{-i h_i t}
                             \prod_{i~\mathrm{odd}} e^{-i h_i t}.
 
 After applying such an evolution operator, you indeed stay in the form of a translation invariant
@@ -340,11 +340,11 @@ class BaseMPSExpectationValue(metaclass=ABCMeta):
         """
         # theta can be any form A / B / theta
         leg = theta.get_leg(virt_leg_index)
-        charges = leg.to_qflat() #  note: sign doesn't matter since -x % 2 == x % 2
+        charges = leg.to_qflat()  # note: sign doesn't matter since -x % 2 == x % 2
         JW_signs = self.sites[self._to_valid_index(i)].charge_to_JW_signs(charges)
         theta.iscale_axis(JW_signs, virt_leg_index)
 
-    def expectation_value_multi_sites(self, operators, i0):
+    def expectation_value_multi_sites(self, operators, i0, insert_JW_from_left=False):
         r"""Expectation value  ``<bra|op0_{i0}op1_{i0+1}...opN_{i0+N}|ket>``.
 
         Calculates the expectation value of a tensor product of single-site operators
@@ -373,6 +373,8 @@ class BaseMPSExpectationValue(metaclass=ABCMeta):
         i0 : int
             The left most index on which an operator acts, i.e.,
             ``operators[i]`` acts on site ``i + i0``.
+        insert_JW_from_left : bool
+            Insert a Jordan-Wigner String to the left if conserved charges are present.
 
         Returns
         -------
@@ -389,7 +391,7 @@ class BaseMPSExpectationValue(metaclass=ABCMeta):
                 In contrast, the :class:`MPS` variant of this method *ignores* the `norm`,
                 i.e. returns the expectation value for the normalized state.
         """
-        C = self._corr_ops_LP(operators, i0)
+        C = self._corr_ops_LP(operators, i0, insert_JW_from_left=insert_JW_from_left)
         C = self._contract_with_RP(C, i0 + len(operators) - 1)
         exp_val = npc.trace(C, 'vR*', 'vL*')
         return self._normalize_exp_val(exp_val)
@@ -670,9 +672,7 @@ class BaseMPSExpectationValue(metaclass=ABCMeta):
         """
         # strategy: translate term into a list "ops" to be used for `expectation_value_multi_sites`
         ops, i_min, has_extra_JW = self._term_to_ops_list(term, autoJW)
-        if has_extra_JW:
-            raise ValueError("Odd number of operators which need a Jordan Wigner string")
-        return self.expectation_value_multi_sites(ops, i_min)
+        return self.expectation_value_multi_sites(ops, i_min, insert_JW_from_left=has_extra_JW)
 
     def expectation_value_terms_sum(self, term_list):
         """Calculate expectation values for a bunch of terms and sum them up.
@@ -1025,7 +1025,7 @@ class BaseMPSExpectationValue(metaclass=ABCMeta):
         JW_from_right : bool | None
             If set to True, a JW-string is coming in from the right. Corresponding `JW` operators
             are added to `ops`.
-            If `None`, use
+            If `None`, use it to determine `has_extra_JW`.
 
         Returns
         -------
@@ -1061,7 +1061,6 @@ class BaseMPSExpectationValue(metaclass=ABCMeta):
                 op_i.append('JW')
         for j in range(len(ops)):
             site = self.sites[self._to_valid_index(j + i_min + i_offset)]
-            i = j + i_min + i_offset
             ops[j] = site.multiply_operators(ops[j])
         return ops, i_min + i_offset, (count_JW % 2 == 1)
 
@@ -1101,17 +1100,22 @@ class BaseMPSExpectationValue(metaclass=ABCMeta):
                 C = npc.tensordot(B_bra.conj(), C, axes=axes_contr)
         return res
 
-    def _corr_ops_LP(self, operators, i0):
+    def _corr_ops_LP(self, operators, i0, insert_JW_from_left=False):
         """Contract the left part of a correlation function.
 
         Same as :meth:`expectation_value_multi_sites`, but with the right-most legs left open,
-        with labels ``'vR*', 'vR'``.
+        with labels ``'vR*', 'vR'``. The option `insert_JW_from_left` inserts a
+        Jordan-Wigner String to the left (if there are conserved charges).
         """
         op = operators[0]
         if (isinstance(op, str)):
             op = self.sites[self._to_valid_index(i0)].get_op(op)
         bra, ket = self._get_bra_ket()
-        theta_ket = ket.get_B(i0, form='Th')
+        if insert_JW_from_left:
+            theta_ket = ket.get_B(i0, form='Th', copy=True)
+            self.apply_JW_string_left_of_virt_leg(theta_ket, 'vL', i0)
+        else:
+            theta_ket = ket.get_B(i0, form='Th')
         theta_bra = bra.get_B(i0, form='Th')
         C = npc.tensordot(op, theta_ket, axes=['p*', 'p'])
         C = self._contract_with_LP(C, i0)  # 'p' 'vR*' 'vR'
@@ -6460,7 +6464,6 @@ class InitialStateBuilder:
         lat = self.lattice
         psi = MPS.from_desired_bond_dimension(lat.mps_sites(), chi, bc=lat.bc_MPS, dtype=dtype)
         return psi
-
 
     def check_filling(self, p_state):
         """Ensure that the filling of the product state matches `check_filling` parameter.
