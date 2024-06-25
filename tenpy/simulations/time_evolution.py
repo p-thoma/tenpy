@@ -176,17 +176,7 @@ class TimeDependentCorrelation(RealTimeEvolution):
                 self.logger.warning("ground-state energy not in resume data")
 
         if not self.loaded_from_checkpoint:
-            if ground_state_filename is None:
-                ground_state_filename = self.options.get('ground_state_filename', None)
-            if ground_state_data is None and ground_state_filename is not None:
-                self.logger.info(
-                    f"loading data from 'ground_state_filename'='{ground_state_filename}'")
-                ground_state_data = hdf5_io.load(ground_state_filename)
-            elif ground_state_data is not None and ground_state_filename is not None:
-                self.logger.warning(
-                    "Supplied a 'ground_state_filename' and ground_state_data as kwarg. "
-                    "Ignoring 'ground_state_filename'.")
-
+            ground_state_data = self._get_ground_state_data(ground_state_filename, ground_state_data)
             if ground_state_data is not None:
                 self.logger.info("Initializing from ground state data")
                 self._init_from_gs_data(ground_state_data)
@@ -214,6 +204,20 @@ class TimeDependentCorrelation(RealTimeEvolution):
         resume_data['psi_ground_state'] = self.psi_ground_state
         resume_data['gs_energy'] = self.gs_energy
         return resume_data
+
+    def _get_ground_state_data(self, ground_state_filename, ground_state_data):
+        """Get data for the groundstate either from simulation kwargs or entry in options"""
+        if ground_state_filename is None:
+            ground_state_filename = self.options.get('ground_state_filename', None)
+        if ground_state_data is None and ground_state_filename is not None:
+            self.logger.info(
+                f"loading data from 'ground_state_filename'='{ground_state_filename}'")
+            ground_state_data = hdf5_io.load(ground_state_filename)
+        elif ground_state_data is not None and ground_state_filename is not None:
+            self.logger.warning(
+                "Supplied a 'ground_state_filename' and ground_state_data as kwarg. "
+                "Ignoring 'ground_state_filename'.")
+        return ground_state_data
 
     def init_measurements(self):
         use_default_meas = self.options.silent_get('use_default_measurements', True)
@@ -366,14 +370,16 @@ class TimeDependentCorrelation(RealTimeEvolution):
         mps_idx = subconfig.get('mps_idx', None)
         lat_idx = subconfig.get('lat_idx', None)
         if mps_idx is not None and lat_idx is not None:
-            raise KeyError("Either a mps_idx or a lat_idx should be passed")
-        elif mps_idx is not None:
+            raise KeyError("Either 'mps_idx' or a 'lat_idx' should be passed, not both.")
+
+        if mps_idx is not None:
             idx = mps_idx
         elif lat_idx is not None:
             idx = lat.lat2mps_idx(lat_idx)
         else:
             mid = np.array(lat.shape) // 2  # default to the middle of the Lattice
             idx = lat.lat2mps_idx(mid)
+
         idx = to_iterable(idx)  # make index an iterable for tiling
         # tiling
         if len(ops) > len(idx):
@@ -399,7 +405,7 @@ class TimeDependentCorrelation(RealTimeEvolution):
         # get required momentum
         ky = subconfig.get('ky', None)  # TODO: should we include a test if the momentum is valid?
         if ky is None:
-            warnings.warn("No momentum for mixed space operator is passed, setting default to 0")
+            warnings.warn("No momentum 'ky' for mixed space operator is passed, setting default to 0")
             ky = 0
         # y indices (a_y = 1, lattice spacing in y-dir, we excluded 2 site unit cells above)
         ys = np.arange(lat.shape[1])  # Ly is lat.shape[1]
@@ -421,12 +427,17 @@ class TimeDependentCorrelation(RealTimeEvolution):
                 w_tot = op_i
             else:
                 w_tot = npc.tensordot(w_tot, op_i, axes=('wR', 'wL'))
-        w_tot = npc.trace(w_tot, 'wL', 'wR')  # or w_tot.squeeze()
-        x_ind_0 = np.array([lat.shape[0]//2, 0, 0])
+        try:
+            w_tot = npc.trace(w_tot, 'wL', 'wR')  # this does not work when there is charge conservation
+        except ValueError:
+            w_tot = w_tot.squeeze() 
+            
+        x_ind_0 = lat.lat2mps_idx(np.array([lat.shape[0]//2, 0, 0]))
         op_list = list(zip([w_tot], x_ind_0))
         return op_list
 
     def apply_operator_t0_to_psi(self):
+        self.logger.info("Applying 'operator_t0' to psi")
         ops_term = self.operator_t0
         if len(ops_term) == 1:
             op, i = ops_term[0]
@@ -463,7 +474,7 @@ class TimeDependentCorrelationEvolveBraKet(TimeDependentCorrelation):
 
     This class allows the calculation of a time-dependent correlation function for arbitrary states
     :math:`|\psi\rangle` (not necessarily ground-states).
-    The time-dependent correlation function is :math:`C(r, t) = \bra{\psi} e^{i H t} B e^{-i H t} A \ket{\psi}`
+    The time-dependent correlation function is :math:`C(r, t) = \langle\psi| e^{i H t} B e^{-i H t} A |\psi\rangle`
     where `B` is the ``operator_t`` and `A` is the ``operator_t0`` at the given site.
 
     .. note ::
